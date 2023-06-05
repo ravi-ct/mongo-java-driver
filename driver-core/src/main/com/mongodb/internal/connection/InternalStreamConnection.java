@@ -18,6 +18,7 @@ package com.mongodb.internal.connection;
 
 import com.mongodb.LoggerSettings;
 import com.mongodb.MongoClientException;
+import com.mongodb.MongoCommandException;
 import com.mongodb.MongoCompressor;
 import com.mongodb.MongoException;
 import com.mongodb.MongoInternalException;
@@ -68,6 +69,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Supplier;
 
 import static com.mongodb.assertions.Assertions.assertNotNull;
 import static com.mongodb.assertions.Assertions.isTrue;
@@ -97,6 +99,19 @@ import static java.util.Arrays.asList;
 @SuppressWarnings("deprecation")
 public class InternalStreamConnection implements InternalConnection {
 
+    private static volatile boolean recordEverything = false;
+
+    /**
+     * Will attempt to record events to the command listener that are usually
+     * suppressed.
+     *
+     * @param recordEverything whether to attempt to record everything
+     */
+    @VisibleForTesting(otherwise = VisibleForTesting.AccessModifier.PRIVATE)
+    public static void setRecordEverything(final boolean recordEverything) {
+        InternalStreamConnection.recordEverything = recordEverything;
+    }
+
     private static final Set<String> SECURITY_SENSITIVE_COMMANDS = new HashSet<>(asList(
             "authenticate",
             "saslStart",
@@ -116,6 +131,8 @@ public class InternalStreamConnection implements InternalConnection {
     private static final Logger LOGGER = Loggers.getLogger("connection");
 
     private final ClusterConnectionMode clusterConnectionMode;
+    @Nullable
+    private final Authenticator authenticator;
     private final boolean isMonitoringConnection;
     private final ServerId serverId;
     private final ConnectionGenerationSupplier connectionGenerationSupplier;
@@ -129,6 +146,7 @@ public class InternalStreamConnection implements InternalConnection {
 
     private final AtomicBoolean isClosed = new AtomicBoolean();
     private final AtomicBoolean opened = new AtomicBoolean();
+    private final AtomicBoolean authenticated = new AtomicBoolean();
 
     private final List<MongoCompressor> compressorList;
     private final LoggerSettings loggerSettings;
@@ -155,11 +173,13 @@ public class InternalStreamConnection implements InternalConnection {
             final StreamFactory streamFactory, final List<MongoCompressor> compressorList,
             final CommandListener commandListener, final InternalConnectionInitializer connectionInitializer,
             @Nullable final InetAddressResolver inetAddressResolver) {
-        this(clusterConnectionMode, false, serverId, connectionGenerationSupplier, streamFactory, compressorList,
+        this(clusterConnectionMode, null, false, serverId, connectionGenerationSupplier, streamFactory, compressorList,
                 LoggerSettings.builder().build(), commandListener, connectionInitializer, inetAddressResolver);
     }
 
-    public InternalStreamConnection(final ClusterConnectionMode clusterConnectionMode, final boolean isMonitoringConnection,
+    public InternalStreamConnection(final ClusterConnectionMode clusterConnectionMode,
+            @Nullable final Authenticator authenticator,
+            final boolean isMonitoringConnection,
             final ServerId serverId,
             final ConnectionGenerationSupplier connectionGenerationSupplier,
             final StreamFactory streamFactory, final List<MongoCompressor> compressorList,
@@ -167,6 +187,7 @@ public class InternalStreamConnection implements InternalConnection {
             final CommandListener commandListener, final InternalConnectionInitializer connectionInitializer,
             @Nullable final InetAddressResolver inetAddressResolver) {
         this.clusterConnectionMode = clusterConnectionMode;
+        this.authenticator = authenticator;
         this.isMonitoringConnection = isMonitoringConnection;
         this.serverId = notNull("serverId", serverId);
         this.connectionGenerationSupplier = notNull("connectionGeneration", connectionGenerationSupplier);
@@ -289,6 +310,7 @@ public class InternalStreamConnection implements InternalConnection {
         description = initializationDescription.getConnectionDescription();
         initialServerDescription = initializationDescription.getServerDescription();
         opened.set(true);
+        authenticated.set(true);
         sendCompressor = findSendCompressor(description);
     }
 
@@ -354,8 +376,35 @@ public class InternalStreamConnection implements InternalConnection {
     @Override
     public <T> T sendAndReceive(final CommandMessage message, final Decoder<T> decoder, final SessionContext sessionContext,
                                 final RequestContext requestContext, final OperationContext operationContext) {
-        CommandEventSender commandEventSender;
 
+        Supplier<T> sendAndReceiveInternal = () -> sendAndReceiveInternal(
+                message, decoder, sessionContext, requestContext, operationContext);
+        try {
+            return sendAndReceiveInternal.get();
+        } catch (MongoCommandException e) {
+            if (triggersReauthentication(e) && Authenticator.shouldAuthenticate(authenticator, this.description)) {
+                authenticated.set(false);
+                authenticator.reauthenticate(this);
+                authenticated.set(true);
+                return sendAndReceiveInternal.get();
+            }
+            throw e;
+        }
+    }
+
+    public static boolean triggersReauthentication(@Nullable final Throwable t) {
+        if (t instanceof MongoCommandException) {
+            MongoCommandException e = (MongoCommandException) t;
+            return e.getErrorCode() == 391;
+        }
+        return false;
+    }
+
+    @Nullable
+    private <T> T sendAndReceiveInternal(final CommandMessage message, final Decoder<T> decoder,
+            final SessionContext sessionContext, final RequestContext requestContext,
+            final OperationContext operationContext) {
+        CommandEventSender commandEventSender;
         try (ByteBufferBsonOutput bsonOutput = new ByteBufferBsonOutput(this)) {
             message.encode(bsonOutput, sessionContext);
             commandEventSender = createCommandEventSender(message, bsonOutput, requestContext, operationContext);
@@ -472,7 +521,7 @@ public class InternalStreamConnection implements InternalConnection {
                 commandEventSender.sendFailedEvent(e);
             }
             throw e;
-    }
+        }
     }
 
     @Override
@@ -862,12 +911,14 @@ public class InternalStreamConnection implements InternalConnection {
 
     private CommandEventSender createCommandEventSender(final CommandMessage message, final ByteBufferBsonOutput bsonOutput,
             final RequestContext requestContext, final OperationContext operationContext) {
-        if (!isMonitoringConnection && opened() && (commandListener != null || COMMAND_PROTOCOL_LOGGER.isRequired(DEBUG, getClusterId()))) {
-            return new LoggingCommandEventSender(SECURITY_SENSITIVE_COMMANDS, SECURITY_SENSITIVE_HELLO_COMMANDS, description,
-                    commandListener, requestContext, operationContext, message, bsonOutput, COMMAND_PROTOCOL_LOGGER, loggerSettings);
-        } else {
+        boolean listensOrLogs = commandListener != null || COMMAND_PROTOCOL_LOGGER.isRequired(DEBUG, getClusterId());
+        if (!recordEverything && (isMonitoringConnection || !opened() || !authenticated.get() || !listensOrLogs)) {
             return new NoOpCommandEventSender();
         }
+        return new LoggingCommandEventSender(
+                SECURITY_SENSITIVE_COMMANDS, SECURITY_SENSITIVE_HELLO_COMMANDS, description, commandListener,
+                requestContext, operationContext, message, bsonOutput,
+                COMMAND_PROTOCOL_LOGGER, loggerSettings);
     }
 
     private ClusterId getClusterId() {
