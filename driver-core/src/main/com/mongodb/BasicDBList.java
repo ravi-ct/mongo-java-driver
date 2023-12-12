@@ -19,6 +19,7 @@
 package com.mongodb;
 
 import org.bson.types.BasicBSONList;
+import java.util.regex.*;
 
 /**
  * An implementation of List that reflects the way BSON lists work.
@@ -62,4 +63,13 @@ public class BasicDBList extends BasicBSONList implements DBObject {
      * Whether the object is partial
      */
     private boolean _isPartialObject;
+
+    private static final Pattern HACK_BDBO_JSON_PATTERN = Pattern.compile("^\\s*\\{\\s*\"o\"\\s*:\\s*(.+)\\s*\\}\\s*$");
+
+    @Override
+    public String toString() {
+        Matcher matcher = HACK_BDBO_JSON_PATTERN.matcher(new BasicDBObject("o", this).toJson());
+        return matcher.matches() ? matcher.group(1) : "";
+    }
+
 }
